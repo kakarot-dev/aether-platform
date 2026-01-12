@@ -27,3 +27,9 @@ pub struct Drive {
 pub struct Action {
     pub action_type: String, // Must be "InstanceStart"
 }
+
+#[derive(Serialize)]
+pub struct NetworkInterface {
+    pub iface_id: String,
+    pub host_dev_name: String,
+}

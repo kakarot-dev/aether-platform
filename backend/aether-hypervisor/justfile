@@ -1,0 +1,41 @@
+# Build the hypervisor with CAP_NET_ADMIN and CAP_SETPCAP capabilities
+build:
+    cargo build --release
+    sudo setcap cap_net_admin,cap_setpcap+eip target/release/aether-hypervisor
+    @echo "✅ Built with CAP_NET_ADMIN and CAP_SETPCAP"
+
+# Build and run the hypervisor
+run: build
+    ./target/release/aether-hypervisor
+
+# Development build (debug mode)
+dev:
+    cargo build
+    sudo setcap cap_net_admin,cap_setpcap+eip target/debug/aether-hypervisor
+    ./target/debug/aether-hypervisor
+
+# Check code without building
+check:
+    cargo check
+
+# Run tests
+test:
+    cargo test
+
+# Clean build artifacts
+clean:
+    cargo clean
+
+# Setup system (one-time: create netdev group and add user)
+setup:
+    sudo groupadd -f netdev
+    sudo usermod -a -G netdev $(USER)
+    @echo "✅ Setup complete! Log out and back in for group changes to take effect."
+
+# Format code
+fmt:
+    cargo fmt
+
+# Run clippy linter
+lint:
+    cargo clippy
