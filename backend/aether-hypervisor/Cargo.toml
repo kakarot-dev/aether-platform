@@ -5,9 +5,7 @@ edition = "2021"
 
 [dependencies]
 # The Official SDK for talking to Firecracker [cite: 363]
-firecracker-rs-sdk = "0.1" 
-# The Async Runtime for managing the VM process [cite: 379]
 tokio = { version = "1", features = ["full"] }
-# Error handling (Boilerplate reduction)
-thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 anyhow = "1.0"
