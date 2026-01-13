@@ -1,31 +1,54 @@
 use crate::client::send_put_request;
 use crate::config::{Action, BootSource, Drive, MachineConfiguration, NetworkInterface};
+use crate::dtos::DeployVmRequest;
 use anyhow::{Context, Result};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::fs;
 use tokio::process::Command;
-use tokio::signal;
+use tokio::sync::Mutex;
 
 mod client;
 mod config;
+mod dtos;
 mod network;
 
+const KERNEL_PATH: &str = "/home/axel/aether-platform/resources/vmlinux.bin";
+const ROOTFS_PATH: &str = "/home/axel/aether-platform/resources/bionic.rootfs.ext4";
+const INSTANCE_DIR: &str = "/tmp/aether-instances";
+
+struct AppState {
+    vms: Mutex<HashMap<String, MicroVM>>,
+}
 // The Hypervisor manages the lifecycle of a single Firecracker process.
 struct MicroVM {
     id: String,
     socket_path: PathBuf,
     // We hold the child process to ensure it doesn't become a zombie.
     process: Option<tokio::process::Child>,
+    tap_name: String,
+    guest_ip: String,
+    gateway_ip: String,
 }
 
 impl MicroVM {
     /// Creates a new MicroVM struct (does not start the process yet)
-    fn new(id: &str) -> Self {
+    fn new(id: &str, tap_name: &str, ip_addr: &str, gateway: &str) -> Self {
         let socket_path = PathBuf::from(format!("/tmp/firecracker_{}.socket", id));
 
         Self {
             id: id.to_string(),
             socket_path,
             process: None,
+            tap_name: tap_name.to_string(),
+            guest_ip: ip_addr.to_string(),
+            gateway_ip: gateway.to_string(),
         }
     }
 
@@ -96,7 +119,10 @@ impl MicroVM {
             // console=ttyS0: Redirects output to the terminal so we can see it.
             // reboot=k: Allows the kernel to reboot the VM.
             // panic=1: Reboot immediately on panic.
-            boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off".to_string()),
+            boot_args: Some(format!(
+                "console=ttyS0 reboot=k panic=1 pci=off ip={}::{}:255.255.255.0::eth0:off",
+                &self.guest_ip, &self.gateway_ip
+            )),
         };
 
         // Send the PUT request to configure the machine
@@ -164,7 +190,7 @@ impl MicroVM {
         println!("🌐 Attaching Network Interface...");
         let net_iface = NetworkInterface {
             iface_id: "eth0".to_string(),
-            host_dev_name: "tap0".to_string(),
+            host_dev_name: self.tap_name.clone(),
         };
         let response = send_put_request(&self.socket_path, "/network-interfaces/eth0", &net_iface)
             .await
@@ -179,43 +205,188 @@ impl MicroVM {
     }
 }
 
+async fn prepare_instance_drive(vm_id: &str) -> Result<String> {
+    use tokio::fs;
+
+    // Ensure instance directory exists
+    if let Err(e) = fs::create_dir_all(INSTANCE_DIR).await {
+        anyhow::bail!(
+            "Failed to create instance directory {}: {}",
+            INSTANCE_DIR,
+            e
+        );
+    }
+
+    let dest_path = format!("{}/rootfs-{}.ext4", INSTANCE_DIR, vm_id);
+
+    // THE CLONE: We copy the clean base image to a unique file for this VM
+    // Warning: This takes time (disk I/O). 300MB takes a few seconds.
+    println!("💿 Cloning filesystem for VM {}...", vm_id);
+
+    if let Err(e) = fs::copy(ROOTFS_PATH, &dest_path).await {
+        anyhow::bail!(
+            "Failed to copy rootfs from {} to {}: {}",
+            ROOTFS_PATH,
+            dest_path,
+            e
+        );
+    }
+
+    println!("✅ Rootfs ready at: {}", dest_path);
+    Ok(dest_path)
+}
+async fn deploy_vm(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DeployVmRequest>,
+) -> impl IntoResponse {
+    // Raise capabilities for this handler context
+    if let Err(e) = network::NetworkManager::raise_ambient_cap_net_admin() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to raise capabilities: {}", e),
+        )
+            .into_response();
+    }
+
+    let vm_id = payload.vm_id;
+    let tap_name = format!("tap-{}", vm_id);
+
+    // 1. Host Network Plumbing (Sudo/Cap required)
+    if let Err(e) = network::NetworkManager::setup_tap_bridge(&tap_name, "br0").await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Net Error: {}", e),
+        )
+            .into_response();
+    }
+
+    // 2. Instantiate VM Struct
+    // Note: We use the constants or payload data here
+    let mut vm = MicroVM::new(&vm_id, &tap_name, "172.16.0.2", "172.16.0.1");
+
+    // 3. Spawn Process
+    if let Err(e) = vm.start_process().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    // 4. Configure Resources (CPU/RAM)
+    if let Err(e) = vm.configure_vm().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    // 5. The Sequence You Asked About (Yes, it goes here!)
+    // We await each step. If one fails, we return Error immediately.
+
+    // Set Boot Source
+    if let Err(e) = vm.set_boot_source(KERNEL_PATH).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Boot Source Error: {}", e),
+        )
+            .into_response();
+    }
+
+    // Prepare unique rootfs drive for this VM (copies the base image)
+    let rootfs_path = match prepare_instance_drive(&vm_id).await {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to prepare instance drive: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    // Attach Drive
+    if let Err(e) = vm.attach_rootfs(&rootfs_path).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("RootFS Error: {}", e),
+        )
+            .into_response();
+    }
+
+    // Attach Network (Guest Side)
+    if let Err(e) = vm.attach_network().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Net Attach Error: {}", e),
+        )
+            .into_response();
+    }
+
+    // 6. Ignite
+    if let Err(e) = vm.start_instance().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Start Error: {}", e),
+        )
+            .into_response();
+    }
+
+    // 7. Health Check - Verify VM actually booted successfully
+    println!("🩺 Performing Health Check...");
+
+    // Wait a moment for early crashes (file lock errors happen fast)
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Check if the Child Process is still running
+    let is_alive = match vm.process.as_mut() {
+        Some(child) => {
+            // try_wait() returns Ok(None) if running, Ok(Some(status)) if exited
+            match child.try_wait() {
+                Ok(None) => true, // Still running!
+                Ok(Some(status)) => {
+                    println!("❌ VM Crashed immediately! Exit Code: {}", status);
+                    false
+                }
+                Err(e) => {
+                    println!("⚠️ Failed to check VM status: {}", e);
+                    false
+                }
+            }
+        }
+        None => false,
+    };
+
+    if !is_alive {
+        // Cleanup the failed TAP device
+        let _ = network::NetworkManager::teardown_tap(&tap_name);
+        // Return error to user
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "VM crashed during boot (check server logs)".to_string(),
+        )
+            .into_response();
+    }
+
+    // 8. Success! NOW we save state and return 200
+    state.vms.lock().await.insert(vm_id.clone(), vm);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "deployed", "id": vm_id })),
+    )
+        .into_response()
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     // Raise capabilities once at the start for all network operations
     network::NetworkManager::raise_ambient_cap_net_admin()?;
 
-    let _ = network::NetworkManager::teardown_tap("tap0");
+    let shared_state = Arc::new(AppState {
+        vms: Mutex::new(HashMap::new()),
+    });
 
-    // Setup Network
-    // Ensure you created 'br0' manually once: `sudo ip link add name br0 type bridge && sudo ip link set br0 up`
-    network::NetworkManager::setup_tap_bridge("tap0", "br0").await?;
+    let app = Router::new()
+        .route("/deploy", post(deploy_vm))
+        .route("/health", get(|| async { "Aether is running" }))
+        .with_state(shared_state.clone());
 
-    // 1. Initialize the VM definition
-    let mut vm = MicroVM::new("test-vm-01");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    println!("🛸 Aether Control Plane listening on port 3000...");
 
-    // 2. Start the empty Firecracker process
-    vm.start_process().await?;
-    vm.configure_vm().await?;
-
-    vm.set_boot_source("/home/axel/aether-platform/resources/vmlinux.bin")
-        .await?;
-    vm.attach_rootfs("/home/axel/aether-platform/resources/bionic.rootfs.ext4")
-        .await?;
-    vm.attach_network().await?;
-    vm.start_instance().await?;
-
-    println!("✅ Firecracker is running! Socket at: {:?}", vm.socket_path);
-    println!("🛑 Press Ctrl+C to stop the VM...");
-
-    // Block the main thread until the interrupt signal (Ctrl+C) is received
-    signal::ctrl_c().await.expect("failed to listen for event");
-
-    println!("⚠️ Signal received. Shutting down...");
-
-    // Cleanup
-    if let Some(mut child) = vm.process.take() {
-        child.kill().await?;
-        println!("💀 VM Shutdown.");
-    }
+    axum::serve(listener, app).await?;
     Ok(())
 }
