@@ -1,6 +1,7 @@
 use crate::client::send_put_request;
 use crate::config::{Action, BootSource, Drive, MachineConfiguration, NetworkInterface};
-use crate::dtos::DeployVmRequest;
+use crate::dtos::{DeployVmRequest, StopVmRequest};
+use crate::ipam::IpAllocator;
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -8,7 +9,9 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::process::Command;
@@ -17,6 +20,7 @@ use tokio::sync::Mutex;
 mod client;
 mod config;
 mod dtos;
+mod ipam;
 mod network;
 
 const KERNEL_PATH: &str = "/home/axel/aether-platform/resources/vmlinux.bin";
@@ -25,6 +29,7 @@ const INSTANCE_DIR: &str = "/tmp/aether-instances";
 
 struct AppState {
     vms: Mutex<HashMap<String, MicroVM>>,
+    ipam: Mutex<IpAllocator>,
 }
 // The Hypervisor manages the lifecycle of a single Firecracker process.
 struct MicroVM {
@@ -35,11 +40,12 @@ struct MicroVM {
     tap_name: String,
     guest_ip: String,
     gateway_ip: String,
+    ip_octet: u8,
 }
 
 impl MicroVM {
     /// Creates a new MicroVM struct (does not start the process yet)
-    fn new(id: &str, tap_name: &str, ip_addr: &str, gateway: &str) -> Self {
+    fn new(id: &str, tap_name: &str, ip_addr: &str, gateway: &str, ip_octet: u8) -> Self {
         let socket_path = PathBuf::from(format!("/tmp/firecracker_{}.socket", id));
 
         Self {
@@ -49,9 +55,9 @@ impl MicroVM {
             tap_name: tap_name.to_string(),
             guest_ip: ip_addr.to_string(),
             gateway_ip: gateway.to_string(),
+            ip_octet,
         }
     }
-
     /// Spawns the Firecracker process in the background.
     /// This is the "Systems" part: manipulating Linux processes.
     async fn start_process(&mut self) -> Result<()> {
@@ -64,12 +70,33 @@ impl MicroVM {
 
         println!("🚀 Spawning Firecracker process for VM: {}", self.id);
 
-        // Command to run firecracker.
-        // We point it to the API socket so we can configure it later.
-        // Redirect stdout/stderr to null to prevent Firecracker logs from interfering
-        let child = Command::new("firecracker")
+        // Create log files for VM serial console output
+        let log_dir = PathBuf::from("/tmp/aether-logs");
+        std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+
+        let stdout_log = log_dir.join(format!("{}-console.log", self.id));
+        let stderr_log = log_dir.join(format!("{}-error.log", self.id));
+
+        let stdout_file = File::create(&stdout_log).context("Failed to create stdout log file")?;
+        let stderr_file = File::create(&stderr_log).context("Failed to create stderr log file")?;
+
+        println!("📝 Serial console will be logged to: {:?}", stdout_log);
+
+        // Command to run firecracker with serial console redirected to log files
+        // Use process_group(0) to isolate from terminal SIGINT (Ctrl+C)
+        // This creates a new process group, preventing Ctrl+C from reaching Firecracker
+        let mut command = Command::new("firecracker");
+        command
             .arg("--api-sock")
             .arg(&self.socket_path)
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file));
+
+        // Only set process group on Unix systems
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let child = command
             .spawn()
             .context("Failed to spawn firecracker binary")?;
 
@@ -111,6 +138,7 @@ impl MicroVM {
 
         Ok(())
     }
+
     async fn set_boot_source(&self, kernel_path: &str) -> Result<()> {
         println!("💿 Setting Boot Source...");
 
@@ -186,6 +214,7 @@ impl MicroVM {
         }
         Ok(())
     }
+
     async fn attach_network(&self) -> Result<()> {
         println!("🌐 Attaching Network Interface...");
         let net_iface = NetworkInterface {
@@ -201,6 +230,23 @@ impl MicroVM {
                 response.lines().next().unwrap_or("Unknown error")
             );
         }
+        Ok(())
+    }
+
+    pub async fn cleanup(&mut self) -> Result<()> {
+        println!("💀 Stopping VM: {}", self.id);
+        if let Some(mut child) = self.process.take() {
+            println!("   -> Killing Firecracker process...");
+            let _ = child.kill().await;
+        }
+        println!("   -> Removing Network Interface {}...", self.tap_name);
+        let _ = network::NetworkManager::teardown_tap(&self.tap_name);
+        let drive_path = format!("/tmp/aether-instances/rootfs-{}.ext4", self.id);
+        if std::path::Path::new(&drive_path).exists() {
+            println!("   -> Deleting Disk Image...");
+            let _ = fs::remove_file(&drive_path).await;
+        }
+
         Ok(())
     }
 }
@@ -239,6 +285,14 @@ async fn deploy_vm(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<DeployVmRequest>,
 ) -> impl IntoResponse {
+    // Assign Ip
+    let octet = {
+        let mut ip_lock = state.ipam.lock().await;
+        match ip_lock.allocate() {
+            Some(i) => i,
+            None => return (StatusCode::SERVICE_UNAVAILABLE, "Subnet Full").into_response(),
+        }
+    };
     // Raise capabilities for this handler context
     if let Err(e) = network::NetworkManager::raise_ambient_cap_net_admin() {
         return (
@@ -247,10 +301,12 @@ async fn deploy_vm(
         )
             .into_response();
     }
-
+    let guest_ip = format!("172.16.0.{}", octet);
+    let gateway_ip = "172.16.0.1";
     let vm_id = payload.vm_id;
     let tap_name = format!("tap-{}", vm_id);
 
+    println!("🛸 Deploying VM with ID: {} and IP: {}", vm_id, guest_ip);
     // 1. Host Network Plumbing (Sudo/Cap required)
     if let Err(e) = network::NetworkManager::setup_tap_bridge(&tap_name, "br0").await {
         return (
@@ -262,7 +318,7 @@ async fn deploy_vm(
 
     // 2. Instantiate VM Struct
     // Note: We use the constants or payload data here
-    let mut vm = MicroVM::new(&vm_id, &tap_name, "172.16.0.2", "172.16.0.1");
+    let mut vm = MicroVM::new(&vm_id, &tap_name, &guest_ip, gateway_ip, octet);
 
     // 3. Spawn Process
     if let Err(e) = vm.start_process().await {
@@ -366,9 +422,39 @@ async fn deploy_vm(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "status": "deployed", "id": vm_id })),
+        Json(serde_json::json!({ "status": "deployed", "id": vm_id, "ip": guest_ip })),
     )
         .into_response()
+}
+
+async fn stop_vm(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<StopVmRequest>,
+) -> impl IntoResponse {
+    let vm_id = payload.vm_id;
+    println!("🛑 Received Stop Request for: {}", vm_id);
+
+    let vm_opt = state.vms.lock().await.remove(&vm_id);
+
+    match vm_opt {
+        Some(mut vm) => {
+            let octet = vm.ip_octet;
+            state.ipam.lock().await.free(octet);
+            if let Err(e) = vm.cleanup().await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to stop VM: {}", e),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "stopped", "id": vm_id })),
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "VM Not Found").into_response(),
+    }
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -377,16 +463,69 @@ async fn main() -> Result<()> {
 
     let shared_state = Arc::new(AppState {
         vms: Mutex::new(HashMap::new()),
+        ipam: Mutex::new(IpAllocator::new()),
     });
 
     let app = Router::new()
         .route("/deploy", post(deploy_vm))
+        .route("/stop", post(stop_vm))
         .route("/health", get(|| async { "Aether is running" }))
         .with_state(shared_state.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     println!("🛸 Aether Control Plane listening on port 3000...");
+    println!("   Press Ctrl+C to stop all VMs and exit gracefully");
 
-    axum::serve(listener, app).await?;
-    Ok(())
+    // Spawn the server in a separate task so we can handle Ctrl+C
+    let server_handle = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    // Wait for Ctrl+C signal
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            println!("\n🛑 Received Ctrl+C, shutting down gracefully...");
+
+            // Clean up all VMs
+            let mut vms = shared_state.vms.lock().await;
+            let vm_ids: Vec<String> = vms.keys().cloned().collect();
+
+            if vm_ids.is_empty() {
+                println!("   No VMs to clean up");
+            } else {
+                println!("   Cleaning up {} VM(s)...", vm_ids.len());
+
+                // Collect all cleanup tasks
+                let mut cleanup_tasks = vec![];
+                for vm_id in vm_ids {
+                    if let Some(mut vm) = vms.remove(&vm_id) {
+                        cleanup_tasks.push(async move {
+                            let id = vm.id.clone();
+                            let octet = vm.ip_octet;
+                            let result = vm.cleanup().await;
+                            (id, octet, result)
+                        });
+                    }
+                }
+                drop(vms); // Release lock before awaiting
+
+                // Execute all cleanups in parallel
+                let results = futures::future::join_all(cleanup_tasks).await;
+
+                // Report results and free IPs
+                for (vm_id, octet, result) in results {
+                    match result {
+                        Ok(_) => println!("   -> Stopped VM: {} ✅", vm_id),
+                        Err(e) => println!("   -> Stopped VM: {} ❌ Error: {}", vm_id, e),
+                    }
+                    shared_state.ipam.lock().await.free(octet);
+                }
+            }
+
+            println!("💀 System Shutdown Complete.");
+            Ok(())
+        }
+        result = server_handle => {
+            result.context("Server task panicked")??;
+            Ok(())
+        }
+    }
 }
