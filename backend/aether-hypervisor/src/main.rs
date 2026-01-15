@@ -83,20 +83,13 @@ impl MicroVM {
         println!("📝 Serial console will be logged to: {:?}", stdout_log);
 
         // Command to run firecracker with serial console redirected to log files
-        // Use process_group(0) to isolate from terminal SIGINT (Ctrl+C)
-        // This creates a new process group, preventing Ctrl+C from reaching Firecracker
-        let mut command = Command::new("firecracker");
-        command
+        // Redirect stdin to null to detach from terminal and prevent signal interference
+        let child = Command::new("firecracker")
             .arg("--api-sock")
             .arg(&self.socket_path)
+            .stdin(Stdio::null())
             .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file));
-
-        // Only set process group on Unix systems
-        #[cfg(unix)]
-        command.process_group(0);
-
-        let child = command
+            .stderr(Stdio::from(stderr_file))
             .spawn()
             .context("Failed to spawn firecracker binary")?;
 
@@ -239,8 +232,16 @@ impl MicroVM {
             println!("   -> Killing Firecracker process...");
             let _ = child.kill().await;
         }
+
+        // Raise capabilities for network operations
         println!("   -> Removing Network Interface {}...", self.tap_name);
-        let _ = network::NetworkManager::teardown_tap(&self.tap_name);
+        if let Err(e) = network::NetworkManager::raise_ambient_cap_net_admin() {
+            eprintln!("   ⚠️ Warning: Failed to raise capabilities for TAP cleanup: {}", e);
+        }
+        if let Err(e) = network::NetworkManager::teardown_tap(&self.tap_name) {
+            eprintln!("   ⚠️ Warning: Failed to remove TAP device: {}", e);
+        }
+
         let drive_path = format!("/tmp/aether-instances/rootfs-{}.ext4", self.id);
         if std::path::Path::new(&drive_path).exists() {
             println!("   -> Deleting Disk Image...");

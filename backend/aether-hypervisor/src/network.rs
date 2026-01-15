@@ -6,15 +6,27 @@ pub struct NetworkManager;
 impl NetworkManager {
     pub async fn setup_tap_bridge(tap_name: &str, bridge_name: &str) -> Result<()> {
         println!("🔧 Network: Creating TAP device '{}'...", tap_name);
-        // 1. Create TAP Device
-        // ip tuntap add dev tap0 mode tap user $USER
-        let user = std::env::var("USER").unwrap_or("root".to_string());
-        run_cmd(
-            "ip",
-            &[
-                "tuntap", "add", "dev", tap_name, "mode", "tap", "user", &user,
-            ],
-        )?;
+
+        // Check if TAP device already exists
+        let check_status = Command::new("ip")
+            .args(&["link", "show", tap_name])
+            .output();
+
+        let tap_exists = check_status.map(|o| o.status.success()).unwrap_or(false);
+
+        if !tap_exists {
+            // 1. Create TAP Device
+            // ip tuntap add dev tap0 mode tap user $USER
+            let user = std::env::var("USER").unwrap_or("root".to_string());
+            run_cmd(
+                "ip",
+                &[
+                    "tuntap", "add", "dev", tap_name, "mode", "tap", "user", &user,
+                ],
+            )?;
+        } else {
+            println!("   ℹ️ TAP device '{}' already exists, reusing...", tap_name);
+        }
 
         // 2. Set TAP Master (Attach to Bridge)
         // ip link set tap0 master br0
@@ -56,7 +68,18 @@ impl NetworkManager {
     }
     /// Clean up (Optional, good for testing)
     pub fn teardown_tap(tap_name: &str) -> Result<()> {
-        let _ = run_cmd("ip", &["link", "delete", tap_name]);
+        // Check if TAP device exists before trying to delete
+        let check_status = Command::new("ip")
+            .args(&["link", "show", tap_name])
+            .output();
+
+        let tap_exists = check_status.map(|o| o.status.success()).unwrap_or(false);
+
+        if tap_exists {
+            run_cmd("ip", &["link", "delete", tap_name])
+                .context(format!("Failed to delete TAP device '{}'", tap_name))?;
+        }
+
         Ok(())
     }
 }

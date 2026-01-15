@@ -26,6 +26,19 @@ test:
 clean:
     cargo clean
 
+# Clean up all VMs and resources (TAP devices, processes, files)
+cleanup:
+    @echo "🧹 Cleaning up all VM resources..."
+    @echo "   -> Killing Firecracker processes..."
+    -pkill -9 firecracker 2>/dev/null || true
+    @echo "   -> Removing TAP devices..."
+    -@for tap in $$(ip link show | grep -o "tap-[^:]*" 2>/dev/null); do \
+        sudo ip link delete $$tap 2>/dev/null || true; \
+    done
+    @echo "   -> Removing temporary files..."
+    -rm -rf /tmp/aether-logs /tmp/aether-instances /tmp/firecracker_*.socket
+    @echo "✅ Cleanup complete!"
+
 # Setup system (one-time: create netdev group and add user)
 setup:
     sudo groupadd -f netdev
