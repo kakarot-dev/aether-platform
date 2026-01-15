@@ -8,6 +8,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
@@ -30,6 +32,7 @@ const INSTANCE_DIR: &str = "/tmp/aether-instances";
 struct AppState {
     vms: Mutex<HashMap<String, MicroVM>>,
     ipam: Mutex<IpAllocator>,
+    db: PgPool,
 }
 // The Hypervisor manages the lifecycle of a single Firecracker process.
 struct MicroVM {
@@ -462,9 +465,27 @@ async fn main() -> Result<()> {
     // Raise capabilities once at the start for all network operations
     network::NetworkManager::raise_ambient_cap_net_admin()?;
 
+    // Load environment variables from .env file
+    dotenvy::dotenv().ok();
+
+    // Connect to PostgreSQL database
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("Failed to connect to Postgres");
+
+    // Run database migrations
+    sqlx::migrate!().run(&pool).await.expect("Failed to run migrations");
+
+    println!("✅ Persistence Layer Active: Connected to Postgres.");
+
     let shared_state = Arc::new(AppState {
         vms: Mutex::new(HashMap::new()),
         ipam: Mutex::new(IpAllocator::new()),
+        db: pool,
     });
 
     let app = Router::new()
