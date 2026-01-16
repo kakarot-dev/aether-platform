@@ -307,12 +307,46 @@ async fn deploy_vm(
     }
     let guest_ip = format!("172.16.0.{}", octet);
     let gateway_ip = "172.16.0.1";
-    let vm_id = payload.vm_id;
+    let vm_id = payload.vm_id.clone();
     let tap_name = format!("tap-{}", vm_id);
 
     println!("🛸 Deploying VM with ID: {} and IP: {}", vm_id, guest_ip);
+
+    // Create DB Record (Mark as 'starting')
+    let vm_uuid = uuid::Uuid::parse_str(&vm_id).unwrap_or_else(|_| uuid::Uuid::new_v4());
+    if let Err(e) = sqlx::query!(
+        r#"
+        INSERT INTO vms (id, name, status, ip_address, tap_interface)
+        VALUES ($1, $2, 'starting', $3, $4)
+        "#,
+        vm_uuid,
+        vm_id,
+        guest_ip,
+        tap_name
+    )
+    .execute(&state.db)
+    .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB Error: {}", e),
+        )
+            .into_response();
+    }
     // 1. Host Network Plumbing (Sudo/Cap required)
     if let Err(e) = network::NetworkManager::setup_tap_bridge(&tap_name, "br0").await {
+        // Mark as failed in DB and free IP
+        println!("❌ Deployment failed at network setup, marking as 'failed' in DB");
+        state.ipam.lock().await.free(octet);
+        if let Err(db_err) = sqlx::query!(
+            r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+            vm_id
+        )
+        .execute(&state.db)
+        .await {
+            eprintln!("⚠️ Failed to update DB status: {}", db_err);
+        }
+
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Net Error: {}", e),
@@ -326,11 +360,15 @@ async fn deploy_vm(
 
     // 3. Spawn Process
     if let Err(e) = vm.start_process().await {
+        state.ipam.lock().await.free(octet);
+        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     // 4. Configure Resources (CPU/RAM)
     if let Err(e) = vm.configure_vm().await {
+        state.ipam.lock().await.free(octet);
+        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
@@ -339,6 +377,8 @@ async fn deploy_vm(
 
     // Set Boot Source
     if let Err(e) = vm.set_boot_source(KERNEL_PATH).await {
+        state.ipam.lock().await.free(octet);
+        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Boot Source Error: {}", e),
@@ -350,6 +390,8 @@ async fn deploy_vm(
     let rootfs_path = match prepare_instance_drive(&vm_id).await {
         Ok(path) => path,
         Err(e) => {
+            state.ipam.lock().await.free(octet);
+            let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to prepare instance drive: {}", e),
@@ -360,6 +402,8 @@ async fn deploy_vm(
 
     // Attach Drive
     if let Err(e) = vm.attach_rootfs(&rootfs_path).await {
+        state.ipam.lock().await.free(octet);
+        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("RootFS Error: {}", e),
@@ -369,6 +413,8 @@ async fn deploy_vm(
 
     // Attach Network (Guest Side)
     if let Err(e) = vm.attach_network().await {
+        state.ipam.lock().await.free(octet);
+        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Net Attach Error: {}", e),
@@ -378,6 +424,8 @@ async fn deploy_vm(
 
     // 6. Ignite
     if let Err(e) = vm.start_instance().await {
+        state.ipam.lock().await.free(octet);
+        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Start Error: {}", e),
@@ -413,6 +461,18 @@ async fn deploy_vm(
     if !is_alive {
         // Cleanup the failed TAP device
         let _ = network::NetworkManager::teardown_tap(&tap_name);
+
+        // Free the IP
+        state.ipam.lock().await.free(octet);
+
+        // Mark VM as failed in database and clear IP
+        let _ = sqlx::query!(
+            r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+            vm_id
+        )
+        .execute(&state.db)
+        .await;
+
         // Return error to user
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -420,6 +480,18 @@ async fn deploy_vm(
         )
             .into_response();
     }
+
+    // Update DB Record (Mark as 'running')
+    sqlx::query!(
+        r#"UPDATE vms SET status = 'running' WHERE name = $1"#,
+        vm_id
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        eprintln!("⚠️ Warning: Failed to update DB status: {}", e);
+    })
+    .ok();
 
     // 8. Success! NOW we save state and return 200
     state.vms.lock().await.insert(vm_id.clone(), vm);
@@ -451,6 +523,15 @@ async fn stop_vm(
                 )
                     .into_response();
             }
+
+            // Update DB Record (Mark as 'stopped' and clear IP)
+            let _ = sqlx::query!(
+                r#"UPDATE vms SET status = 'stopped', ip_address = NULL WHERE name = $1"#,
+                vm_id
+            )
+            .execute(&state.db)
+            .await;
+
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "status": "stopped", "id": vm_id })),
@@ -481,6 +562,23 @@ async fn main() -> Result<()> {
     sqlx::migrate!().run(&pool).await.expect("Failed to run migrations");
 
     println!("✅ Persistence Layer Active: Connected to Postgres.");
+
+    // Startup reconciliation: Mark orphaned VMs as 'crashed' and free IPs
+    let orphaned_count = sqlx::query!(
+        r#"
+        UPDATE vms
+        SET status = 'crashed', ip_address = NULL
+        WHERE status IN ('starting', 'running')
+        "#
+    )
+    .execute(&pool)
+    .await
+    .map(|result| result.rows_affected())
+    .unwrap_or(0);
+
+    if orphaned_count > 0 {
+        println!("🔄 Marked {} orphaned VM(s) as crashed and freed their IPs", orphaned_count);
+    }
 
     let shared_state = Arc::new(AppState {
         vms: Mutex::new(HashMap::new()),
@@ -535,8 +633,26 @@ async fn main() -> Result<()> {
                 // Report results and free IPs
                 for (vm_id, octet, result) in results {
                     match result {
-                        Ok(_) => println!("   -> Stopped VM: {} ✅", vm_id),
-                        Err(e) => println!("   -> Stopped VM: {} ❌ Error: {}", vm_id, e),
+                        Ok(_) => {
+                            println!("   -> Stopped VM: {} ✅", vm_id);
+                            // Mark as stopped in DB and clear IP
+                            let _ = sqlx::query!(
+                                r#"UPDATE vms SET status = 'stopped', ip_address = NULL WHERE name = $1"#,
+                                vm_id
+                            )
+                            .execute(&shared_state.db)
+                            .await;
+                        }
+                        Err(e) => {
+                            println!("   -> Stopped VM: {} ❌ Error: {}", vm_id, e);
+                            // Mark as failed in DB and clear IP
+                            let _ = sqlx::query!(
+                                r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+                                vm_id
+                            )
+                            .execute(&shared_state.db)
+                            .await;
+                        }
                     }
                     shared_state.ipam.lock().await.free(octet);
                 }
