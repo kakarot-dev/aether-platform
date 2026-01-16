@@ -1,6 +1,6 @@
 use crate::client::send_put_request;
 use crate::config::{Action, BootSource, Drive, MachineConfiguration, NetworkInterface};
-use crate::dtos::{DeployVmRequest, StopVmRequest};
+use crate::dtos::{DeployVmRequest, StopVmRequest, SystemInfo, VmStatus};
 use crate::ipam::IpAllocator;
 use anyhow::{Context, Result};
 use axum::extract::State;
@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tower_http::services::ServeDir;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -22,17 +23,19 @@ use tokio::sync::Mutex;
 mod client;
 mod config;
 mod dtos;
+mod firewall;
 mod ipam;
 mod network;
 
 const KERNEL_PATH: &str = "/home/axel/aether-platform/resources/vmlinux.bin";
-const ROOTFS_PATH: &str = "/home/axel/aether-platform/resources/bionic.rootfs.ext4";
+const ROOTFS_PATH: &str = "/home/axel/aether-platform/resources/aether-base.ext4";
 const INSTANCE_DIR: &str = "/tmp/aether-instances";
 
 struct AppState {
     vms: Mutex<HashMap<String, MicroVM>>,
     ipam: Mutex<IpAllocator>,
     db: PgPool,
+    network_manager: network::NetworkManager,
 }
 // The Hypervisor manages the lifecycle of a single Firecracker process.
 struct MicroVM {
@@ -229,26 +232,46 @@ impl MicroVM {
         Ok(())
     }
 
-    pub async fn cleanup(&mut self) -> Result<()> {
+    pub async fn cleanup(&mut self, net_mgr: &network::NetworkManager) -> Result<()> {
         println!("💀 Stopping VM: {}", self.id);
         if let Some(mut child) = self.process.take() {
             println!("   -> Killing Firecracker process...");
             let _ = child.kill().await;
         }
 
-        // Raise capabilities for network operations
+        // Remove persistent TAP device using native netlink
         println!("   -> Removing Network Interface {}...", self.tap_name);
-        if let Err(e) = network::NetworkManager::raise_ambient_cap_net_admin() {
-            eprintln!("   ⚠️ Warning: Failed to raise capabilities for TAP cleanup: {}", e);
-        }
-        if let Err(e) = network::NetworkManager::teardown_tap(&self.tap_name) {
+        if let Err(e) = net_mgr.teardown_tap(&self.tap_name).await {
             eprintln!("   ⚠️ Warning: Failed to remove TAP device: {}", e);
         }
 
+        // Delete Firecracker socket file
+        if self.socket_path.exists() {
+            println!("   -> Deleting Socket File...");
+            if let Err(e) = fs::remove_file(&self.socket_path).await {
+                eprintln!("   ⚠️ Warning: Failed to remove socket file: {}", e);
+            }
+        }
+
+        // Delete disk image
         let drive_path = format!("/tmp/aether-instances/rootfs-{}.ext4", self.id);
         if std::path::Path::new(&drive_path).exists() {
             println!("   -> Deleting Disk Image...");
             let _ = fs::remove_file(&drive_path).await;
+        }
+
+        // Delete log files
+        let console_log = format!("/tmp/aether-logs/{}-console.log", self.id);
+        let error_log = format!("/tmp/aether-logs/{}-error.log", self.id);
+
+        if std::path::Path::new(&console_log).exists() {
+            println!("   -> Deleting Console Log...");
+            let _ = fs::remove_file(&console_log).await;
+        }
+
+        if std::path::Path::new(&error_log).exists() {
+            println!("   -> Deleting Error Log...");
+            let _ = fs::remove_file(&error_log).await;
         }
 
         Ok(())
@@ -289,6 +312,34 @@ async fn deploy_vm(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<DeployVmRequest>,
 ) -> impl IntoResponse {
+    let vm_id = payload.vm_id.clone();
+
+    // Validate vm_id
+    if vm_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "vm_id cannot be empty".to_string()).into_response();
+    }
+
+    // TAP device names have a 15 character limit in Linux
+    if vm_id.len() > 15 {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "vm_id too long (max 15 chars, got {}). Linux TAP device name limit.",
+                vm_id.len()
+            ),
+        )
+            .into_response();
+    }
+
+    // Only allow alphanumeric and dashes (safe for TAP device names)
+    if !vm_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "vm_id can only contain alphanumeric characters and dashes".to_string(),
+        )
+            .into_response();
+    }
+
     // Assign Ip
     let octet = {
         let mut ip_lock = state.ipam.lock().await;
@@ -297,18 +348,9 @@ async fn deploy_vm(
             None => return (StatusCode::SERVICE_UNAVAILABLE, "Subnet Full").into_response(),
         }
     };
-    // Raise capabilities for this handler context
-    if let Err(e) = network::NetworkManager::raise_ambient_cap_net_admin() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to raise capabilities: {}", e),
-        )
-            .into_response();
-    }
     let guest_ip = format!("172.16.0.{}", octet);
     let gateway_ip = "172.16.0.1";
-    let vm_id = payload.vm_id.clone();
-    let tap_name = format!("tap-{}", vm_id);
+    let tap_name = vm_id.clone(); // Use vm_id directly as TAP name
 
     println!("🛸 Deploying VM with ID: {} and IP: {}", vm_id, guest_ip);
 
@@ -333,8 +375,13 @@ async fn deploy_vm(
         )
             .into_response();
     }
-    // 1. Host Network Plumbing (Sudo/Cap required)
-    if let Err(e) = network::NetworkManager::setup_tap_bridge(&tap_name, "br0").await {
+
+    // 1. Host Network Plumbing using native APIs
+    if let Err(e) = state
+        .network_manager
+        .setup_tap_bridge(&tap_name, "br0")
+        .await
+    {
         // Mark as failed in DB and free IP
         println!("❌ Deployment failed at network setup, marking as 'failed' in DB");
         state.ipam.lock().await.free(octet);
@@ -343,7 +390,8 @@ async fn deploy_vm(
             vm_id
         )
         .execute(&state.db)
-        .await {
+        .await
+        {
             eprintln!("⚠️ Failed to update DB status: {}", db_err);
         }
 
@@ -361,14 +409,26 @@ async fn deploy_vm(
     // 3. Spawn Process
     if let Err(e) = vm.start_process().await {
         state.ipam.lock().await.free(octet);
-        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
+        let _ = state.network_manager.teardown_tap(&tap_name).await; // Cleanup TAP
+        let _ = sqlx::query!(
+            r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+            vm_id
+        )
+        .execute(&state.db)
+        .await;
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     // 4. Configure Resources (CPU/RAM)
     if let Err(e) = vm.configure_vm().await {
         state.ipam.lock().await.free(octet);
-        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
+        let _ = state.network_manager.teardown_tap(&tap_name).await; // Cleanup TAP
+        let _ = sqlx::query!(
+            r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+            vm_id
+        )
+        .execute(&state.db)
+        .await;
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
@@ -378,7 +438,13 @@ async fn deploy_vm(
     // Set Boot Source
     if let Err(e) = vm.set_boot_source(KERNEL_PATH).await {
         state.ipam.lock().await.free(octet);
-        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
+        let _ = state.network_manager.teardown_tap(&tap_name).await; // Cleanup TAP
+        let _ = sqlx::query!(
+            r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+            vm_id
+        )
+        .execute(&state.db)
+        .await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Boot Source Error: {}", e),
@@ -391,7 +457,13 @@ async fn deploy_vm(
         Ok(path) => path,
         Err(e) => {
             state.ipam.lock().await.free(octet);
-            let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
+            let _ = state.network_manager.teardown_tap(&tap_name).await; // Cleanup TAP
+            let _ = sqlx::query!(
+                r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+                vm_id
+            )
+            .execute(&state.db)
+            .await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to prepare instance drive: {}", e),
@@ -403,7 +475,13 @@ async fn deploy_vm(
     // Attach Drive
     if let Err(e) = vm.attach_rootfs(&rootfs_path).await {
         state.ipam.lock().await.free(octet);
-        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
+        let _ = state.network_manager.teardown_tap(&tap_name).await; // Cleanup TAP
+        let _ = sqlx::query!(
+            r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+            vm_id
+        )
+        .execute(&state.db)
+        .await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("RootFS Error: {}", e),
@@ -414,7 +492,13 @@ async fn deploy_vm(
     // Attach Network (Guest Side)
     if let Err(e) = vm.attach_network().await {
         state.ipam.lock().await.free(octet);
-        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
+        let _ = state.network_manager.teardown_tap(&tap_name).await; // Cleanup TAP
+        let _ = sqlx::query!(
+            r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+            vm_id
+        )
+        .execute(&state.db)
+        .await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Net Attach Error: {}", e),
@@ -425,7 +509,13 @@ async fn deploy_vm(
     // 6. Ignite
     if let Err(e) = vm.start_instance().await {
         state.ipam.lock().await.free(octet);
-        let _ = sqlx::query!(r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#, vm_id).execute(&state.db).await;
+        let _ = state.network_manager.teardown_tap(&tap_name).await; // Cleanup TAP
+        let _ = sqlx::query!(
+            r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+            vm_id
+        )
+        .execute(&state.db)
+        .await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Start Error: {}", e),
@@ -460,7 +550,7 @@ async fn deploy_vm(
 
     if !is_alive {
         // Cleanup the failed TAP device
-        let _ = network::NetworkManager::teardown_tap(&tap_name);
+        let _ = state.network_manager.teardown_tap(&tap_name).await;
 
         // Free the IP
         state.ipam.lock().await.free(octet);
@@ -516,7 +606,7 @@ async fn stop_vm(
         Some(mut vm) => {
             let octet = vm.ip_octet;
             state.ipam.lock().await.free(octet);
-            if let Err(e) = vm.cleanup().await {
+            if let Err(e) = vm.cleanup(&state.network_manager).await {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to stop VM: {}", e),
@@ -541,10 +631,92 @@ async fn stop_vm(
         None => (StatusCode::NOT_FOUND, "VM Not Found").into_response(),
     }
 }
+
+async fn list_vms(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Query database for all VMs
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, name, status, ip_address, tap_interface
+        FROM vms
+        ORDER BY created_at DESC
+        "#
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let vms: Vec<VmStatus> = rows
+        .into_iter()
+        .map(|row| VmStatus {
+            id: row.name,
+            ip: row.ip_address.unwrap_or_else(|| "N/A".to_string()),
+            status: row.status,
+            tap: row.tap_interface.unwrap_or_else(|| "N/A".to_string()),
+        })
+        .collect();
+
+    (StatusCode::OK, Json(vms)).into_response()
+}
+
+async fn system_info() -> impl IntoResponse {
+    // Get host IP address by reading network interfaces
+    let host_ip = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("ip route get 1 | awk '{print $7; exit}'")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "N/A".to_string());
+
+    // Get primary interface name
+    let interface = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("ip route get 1 | awk '{print $5; exit}'")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "eth0".to_string());
+
+    let info = SystemInfo {
+        host_ip,
+        bridge_ip: "172.16.0.1".to_string(),
+        vm_subnet: "172.16.0.0/24".to_string(),
+        interface,
+    };
+
+    (StatusCode::OK, Json(info)).into_response()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Raise capabilities once at the start for all network operations
     network::NetworkManager::raise_ambient_cap_net_admin()?;
+
+    // Initialize native network manager
+    let net_mgr = network::NetworkManager::new()
+        .await
+        .context("Failed to initialize NetworkManager")?;
+
+    println!("✅ Native NetworkManager initialized");
+
+    // Initialize firewall manager
+    let firewall_mgr =
+        firewall::FirewallManager::new().context("Failed to initialize FirewallManager")?;
+
+    // Enable IP forwarding for VM routing
+    firewall_mgr
+        .enable_ip_forwarding()
+        .context("Failed to enable IP forwarding")?;
+
+    // Setup NAT rules for VM subnet
+    firewall_mgr
+        .setup_nat("br0", "172.16.0.0/24")
+        .context("Failed to setup NAT rules")?;
+
+    // Keep firewall_mgr in scope - it will cleanup NAT rules via Drop when program exits
+    let _firewall_mgr = firewall_mgr;
 
     // Load environment variables from .env file
     dotenvy::dotenv().ok();
@@ -559,7 +731,10 @@ async fn main() -> Result<()> {
         .expect("Failed to connect to Postgres");
 
     // Run database migrations
-    sqlx::migrate!().run(&pool).await.expect("Failed to run migrations");
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .expect("Failed to run migrations");
 
     println!("✅ Persistence Layer Active: Connected to Postgres.");
 
@@ -577,23 +752,31 @@ async fn main() -> Result<()> {
     .unwrap_or(0);
 
     if orphaned_count > 0 {
-        println!("🔄 Marked {} orphaned VM(s) as crashed and freed their IPs", orphaned_count);
+        println!(
+            "🔄 Marked {} orphaned VM(s) as crashed and freed their IPs",
+            orphaned_count
+        );
     }
 
     let shared_state = Arc::new(AppState {
         vms: Mutex::new(HashMap::new()),
         ipam: Mutex::new(IpAllocator::new()),
         db: pool,
+        network_manager: net_mgr,
     });
 
     let app = Router::new()
-        .route("/deploy", post(deploy_vm))
-        .route("/stop", post(stop_vm))
-        .route("/health", get(|| async { "Aether is running" }))
+        .route("/api/deploy", post(deploy_vm))
+        .route("/api/stop", post(stop_vm))
+        .route("/api/vms", get(list_vms))
+        .route("/api/system", get(system_info))
+        .route("/api/health", get(|| async { "Aether is running" }))
+        .fallback_service(ServeDir::new("static"))
         .with_state(shared_state.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     println!("🛸 Aether Control Plane listening on port 3000...");
+    println!("📊 Dashboard available at http://localhost:3000");
     println!("   Press Ctrl+C to stop all VMs and exit gracefully");
 
     // Spawn the server in a separate task so we can handle Ctrl+C
@@ -615,12 +798,14 @@ async fn main() -> Result<()> {
 
                 // Collect all cleanup tasks
                 let mut cleanup_tasks = vec![];
+                let net_mgr = &shared_state.network_manager;
+
                 for vm_id in vm_ids {
                     if let Some(mut vm) = vms.remove(&vm_id) {
                         cleanup_tasks.push(async move {
                             let id = vm.id.clone();
                             let octet = vm.ip_octet;
-                            let result = vm.cleanup().await;
+                            let result = vm.cleanup(net_mgr).await;
                             (id, octet, result)
                         });
                     }
