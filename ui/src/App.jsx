@@ -72,6 +72,24 @@ function App() {
     }
   }
 
+  // Delete VM
+  const handleDelete = async (id) => {
+    if (!confirm(`Delete VM "${id}" from database? This cannot be undone.`)) {
+      return
+    }
+
+    try {
+      await fetch('/api/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ vm_id: id })
+      })
+      fetchVms()
+    } catch (e) {
+      console.error('Failed to delete VM:', e)
+    }
+  }
+
   const runningVms = vms.filter(vm => vm.status === 'running').length
   const stoppedVms = vms.filter(vm => vm.status === 'stopped').length
 
@@ -200,7 +218,11 @@ function App() {
                       <div className="text-xs text-green-700 mb-1">IP ADDRESS</div>
                       <div className="text-green-300">
                         {vm.ip === 'N/A' ? (
-                          <span className="text-yellow-600 animate-pulse">ALLOCATING...</span>
+                          vm.status === 'running' || vm.status === 'starting' ? (
+                            <span className="text-yellow-600 animate-pulse">ALLOCATING...</span>
+                          ) : (
+                            <span className="text-gray-600">N/A</span>
+                          )
                         ) : (
                           vm.ip
                         )}
@@ -233,7 +255,7 @@ function App() {
                   </div>
 
                   {/* Actions */}
-                  <div className="ml-4">
+                  <div className="ml-4 flex gap-2">
                     {vm.status === 'running' && (
                       <button
                         onClick={() => handleStop(vm.id)}
@@ -242,8 +264,79 @@ function App() {
                         TERMINATE
                       </button>
                     )}
+                    {vm.status === 'stopped' && (
+                      <button
+                        onClick={() => handleDelete(vm.id)}
+                        className="px-4 py-2 bg-gray-900/20 hover:bg-gray-800/30 border border-gray-700 hover:border-gray-500 text-gray-400 text-sm font-semibold rounded transition-all duration-200"
+                      >
+                        DELETE
+                      </button>
+                    )}
                   </div>
                 </div>
+
+                {/* Resource Stats (only for running VMs) */}
+                {vm.status === 'running' && vm.stats && (
+                  <div className="mt-4 pt-4 border-t border-green-900/30">
+                    <div className="text-xs text-green-700 mb-3 font-semibold tracking-wider">RESOURCE USAGE</div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      {/* CPU Usage */}
+                      <div>
+                        <div className="flex justify-between items-center mb-2">
+                          <span className="text-xs text-green-600">CPU</span>
+                          <span className="text-xs text-green-400 font-mono">{vm.stats.cpu_usage_percent.toFixed(1)}%</span>
+                        </div>
+                        <div className="w-full bg-gray-900 rounded-full h-2 overflow-hidden border border-green-900/50">
+                          <div
+                            className="bg-gradient-to-r from-emerald-600 to-green-500 h-full transition-all duration-300"
+                            style={{ width: `${Math.min(vm.stats.cpu_usage_percent, 100)}%` }}
+                          ></div>
+                        </div>
+                        <div className="text-xs text-green-800 mt-1">
+                          Limit: 20% | Throttled: {vm.stats.throttle_percent.toFixed(0)}%
+                        </div>
+                      </div>
+
+                      {/* Memory Usage */}
+                      <div>
+                        <div className="flex justify-between items-center mb-2">
+                          <span className="text-xs text-green-600">MEMORY</span>
+                          <span className="text-xs text-green-400 font-mono">
+                            {(vm.stats.memory_usage_bytes / 1024 / 1024).toFixed(0)} MB / {(vm.stats.memory_limit_bytes / 1024 / 1024).toFixed(0)} MB
+                          </span>
+                        </div>
+                        <div className="w-full bg-gray-900 rounded-full h-2 overflow-hidden border border-green-900/50">
+                          <div
+                            className="bg-gradient-to-r from-cyan-600 to-blue-500 h-full transition-all duration-300"
+                            style={{ width: `${Math.min(vm.stats.memory_usage_percent, 100)}%` }}
+                          ></div>
+                        </div>
+                        <div className="text-xs text-green-800 mt-1">
+                          Usage: {vm.stats.memory_usage_percent.toFixed(1)}%
+                        </div>
+                      </div>
+
+                      {/* Throttle Stats */}
+                      <div>
+                        <div className="flex justify-between items-center mb-2">
+                          <span className="text-xs text-green-600">THROTTLING</span>
+                          <span className="text-xs text-green-400 font-mono">
+                            {vm.stats.throttled_periods} / {vm.stats.total_periods}
+                          </span>
+                        </div>
+                        <div className="w-full bg-gray-900 rounded-full h-2 overflow-hidden border border-green-900/50">
+                          <div
+                            className="bg-gradient-to-r from-yellow-600 to-orange-500 h-full transition-all duration-300"
+                            style={{ width: `${Math.min(vm.stats.throttle_percent, 100)}%` }}
+                          ></div>
+                        </div>
+                        <div className="text-xs text-green-800 mt-1">
+                          {vm.stats.throttle_percent > 50 ? 'Resource Limited' : 'Normal'}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             ))
           )}

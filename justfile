@@ -4,15 +4,15 @@ build:
     sudo setcap cap_net_admin,cap_setpcap+eip target/release/aether-hypervisor
     @echo "✅ Built with CAP_NET_ADMIN and CAP_SETPCAP"
 
-# Build and run the hypervisor
+# Build and run the hypervisor (requires root for cgroups)
 run: build
-    ./target/release/aether-hypervisor
+    sudo ./target/release/aether-hypervisor
 
-# Development build (debug mode)
+# Development build (debug mode, requires root for cgroups)
 dev:
     cargo build
     sudo setcap cap_net_admin,cap_setpcap+eip target/debug/aether-hypervisor
-    ./target/debug/aether-hypervisor
+    sudo ./target/debug/aether-hypervisor
 
 # Check code without building
 check:
@@ -43,6 +43,11 @@ cleanup:
     -sudo iptables -t filter -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     -sudo iptables -t filter -D FORWARD -i br0 -o eth0 -j ACCEPT 2>/dev/null || true
     -sudo iptables -t filter -D FORWARD -i br0 -o br0 -j DROP 2>/dev/null || true
+    @echo "   -> Removing cgroups..."
+    -sudo find /sys/fs/cgroup/cpu/aether -mindepth 1 -maxdepth 1 -type d -exec rmdir {} \; 2>/dev/null || true
+    -sudo rmdir /sys/fs/cgroup/cpu/aether 2>/dev/null || true
+    -sudo find /sys/fs/cgroup/memory/aether -mindepth 1 -maxdepth 1 -type d -exec rmdir {} \; 2>/dev/null || true
+    -sudo rmdir /sys/fs/cgroup/memory/aether 2>/dev/null || true
     @echo "✅ Cleanup complete!"
 
 # Verify cleanup - check if all VM resources are gone
@@ -63,6 +68,12 @@ verify-cleanup VM_ID:
     @echo ""
     @echo "Error log:"
     @test ! -f /tmp/aether-logs/{{VM_ID}}-error.log && echo "  ✅ Cleaned up" || echo "  ❌ Still exists"
+    @echo ""
+    @echo "CPU Cgroup:"
+    @test ! -d /sys/fs/cgroup/cpu/aether/{{VM_ID}} && echo "  ✅ Cleaned up" || echo "  ❌ Still exists"
+    @echo ""
+    @echo "Memory Cgroup:"
+    @test ! -d /sys/fs/cgroup/memory/aether/{{VM_ID}} && echo "  ✅ Cleaned up" || echo "  ❌ Still exists"
 
 # Check firewall status
 check-firewall:

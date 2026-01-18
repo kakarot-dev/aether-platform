@@ -1,6 +1,6 @@
 use crate::client::send_put_request;
 use crate::config::{Action, BootSource, Drive, MachineConfiguration, NetworkInterface};
-use crate::dtos::{DeployVmRequest, StopVmRequest, SystemInfo, VmStatus};
+use crate::dtos::{DeleteVmRequest, DeployVmRequest, StopVmRequest, SystemInfo, VmStatus};
 use crate::ipam::IpAllocator;
 use anyhow::{Context, Result};
 use axum::extract::State;
@@ -20,6 +20,7 @@ use tokio::fs;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+mod cgroups;
 mod client;
 mod config;
 mod dtos;
@@ -239,6 +240,12 @@ impl MicroVM {
             let _ = child.kill().await;
         }
 
+        // Remove cgroup
+        println!("   -> Removing Cgroup...");
+        if let Err(e) = cgroups::remove_vm_cgroup(&self.id) {
+            eprintln!("   ⚠️ Warning: Failed to remove cgroup: {}", e);
+        }
+
         // Remove persistent TAP device using native netlink
         println!("   -> Removing Network Interface {}...", self.tap_name);
         if let Err(e) = net_mgr.teardown_tap(&self.tap_name).await {
@@ -354,6 +361,27 @@ async fn deploy_vm(
 
     println!("🛸 Deploying VM with ID: {} and IP: {}", vm_id, guest_ip);
 
+    // Setup Cgroup (before spawning process)
+    if let Err(e) = cgroups::create_vm_cgroup(&vm_id) {
+        eprintln!("⚠️ Cgroup creation failed: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cgroup Error: {}", e),
+        )
+            .into_response();
+    }
+
+    // Apply resource limits: 20% CPU (20000), 128MB RAM
+    if let Err(e) = cgroups::apply_limits(&vm_id, 20000, 128 * 1024 * 1024) {
+        eprintln!("⚠️ Cgroup limits failed: {}", e);
+        let _ = cgroups::remove_vm_cgroup(&vm_id);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cgroup Limits Error: {}", e),
+        )
+            .into_response();
+    }
+
     // Create DB Record (Mark as 'starting')
     let vm_uuid = uuid::Uuid::parse_str(&vm_id).unwrap_or_else(|_| uuid::Uuid::new_v4());
     if let Err(e) = sqlx::query!(
@@ -410,6 +438,7 @@ async fn deploy_vm(
     if let Err(e) = vm.start_process().await {
         state.ipam.lock().await.free(octet);
         let _ = state.network_manager.teardown_tap(&tap_name).await; // Cleanup TAP
+        let _ = cgroups::remove_vm_cgroup(&vm_id); // Cleanup cgroup
         let _ = sqlx::query!(
             r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
             vm_id
@@ -417,6 +446,49 @@ async fn deploy_vm(
         .execute(&state.db)
         .await;
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    // Move the spawned process into the cgroup
+    let pid = vm.process.as_ref().and_then(|p| p.id()).ok_or_else(|| {
+        anyhow::anyhow!("Failed to get process ID")
+    });
+
+    match pid {
+        Ok(pid) => {
+            if let Err(e) = cgroups::add_process(&vm_id, pid) {
+                eprintln!("⚠️ Failed to jail process: {}", e);
+                // Kill the VM since it's running unconstrained
+                state.ipam.lock().await.free(octet);
+                let _ = vm.cleanup(&state.network_manager).await;
+                let _ = sqlx::query!(
+                    r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+                    vm_id
+                )
+                .execute(&state.db)
+                .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Cgroup Process Jail Error: {}", e),
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            eprintln!("⚠️ Failed to get process ID: {}", e);
+            state.ipam.lock().await.free(octet);
+            let _ = vm.cleanup(&state.network_manager).await;
+            let _ = sqlx::query!(
+                r#"UPDATE vms SET status = 'failed', ip_address = NULL WHERE name = $1"#,
+                vm_id
+            )
+            .execute(&state.db)
+            .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to get process ID".to_string(),
+            )
+                .into_response();
+        }
     }
 
     // 4. Configure Resources (CPU/RAM)
@@ -632,6 +704,38 @@ async fn stop_vm(
     }
 }
 
+async fn delete_vm(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DeleteVmRequest>,
+) -> impl IntoResponse {
+    let vm_id = payload.vm_id;
+    println!("🗑️  Received Delete Request for: {}", vm_id);
+
+    // Delete from database
+    let result = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, vm_id)
+        .execute(&state.db)
+        .await;
+
+    match result {
+        Ok(res) => {
+            if res.rows_affected() > 0 {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "status": "deleted", "id": vm_id })),
+                )
+                    .into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "VM Not Found").into_response()
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response(),
+    }
+}
+
 async fn list_vms(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Query database for all VMs
     let rows = sqlx::query!(
@@ -647,11 +751,21 @@ async fn list_vms(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     let vms: Vec<VmStatus> = rows
         .into_iter()
-        .map(|row| VmStatus {
-            id: row.name,
-            ip: row.ip_address.unwrap_or_else(|| "N/A".to_string()),
-            status: row.status,
-            tap: row.tap_interface.unwrap_or_else(|| "N/A".to_string()),
+        .map(|row| {
+            // Try to get stats for running VMs
+            let stats = if row.status == "running" {
+                cgroups::get_stats(&row.name).ok()
+            } else {
+                None
+            };
+
+            VmStatus {
+                id: row.name,
+                ip: row.ip_address.unwrap_or_else(|| "N/A".to_string()),
+                status: row.status,
+                tap: row.tap_interface.unwrap_or_else(|| "N/A".to_string()),
+                stats,
+            }
         })
         .collect();
 
@@ -693,6 +807,13 @@ async fn system_info() -> impl IntoResponse {
 async fn main() -> Result<()> {
     // Raise capabilities once at the start for all network operations
     network::NetworkManager::raise_ambient_cap_net_admin()?;
+
+    // Initialize cgroups (requires root)
+    if let Err(e) = cgroups::initialize() {
+        eprintln!("⚠️ Failed to initialize cgroups: {}. Run as Root!", e);
+        anyhow::bail!("Cgroups initialization failed");
+    }
+    println!("✅ Cgroups initialized");
 
     // Initialize native network manager
     let net_mgr = network::NetworkManager::new()
@@ -768,6 +889,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/api/deploy", post(deploy_vm))
         .route("/api/stop", post(stop_vm))
+        .route("/api/delete", post(delete_vm))
         .route("/api/vms", get(list_vms))
         .route("/api/system", get(system_info))
         .route("/api/health", get(|| async { "Aether is running" }))
