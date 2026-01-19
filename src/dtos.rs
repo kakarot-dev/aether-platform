@@ -33,3 +33,28 @@ pub struct SystemInfo {
     pub vm_subnet: String,
     pub interface: String,
 }
+
+#[derive(Deserialize)]
+pub struct VmIdRequest {
+    pub vm_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct SnapshotRequest {
+    pub vm_id: String,
+    pub description: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct RestoreRequest {
+    pub snapshot_id: String,
+    pub new_vm_id: String,
+}
+
+#[derive(Serialize)]
+pub struct SnapshotInfo {
+    pub id: String,
+    pub vm_id: String,
+    pub created_at: String,
+    pub size_mb: i32,
+}

@@ -1,6 +1,6 @@
-use crate::client::send_put_request;
-use crate::config::{Action, BootSource, Drive, MachineConfiguration, NetworkInterface};
-use crate::dtos::{DeleteVmRequest, DeployVmRequest, StopVmRequest, SystemInfo, VmStatus};
+use crate::client::{send_patch_request, send_put_request};
+use crate::config::{Action, BootSource, Drive, MachineConfiguration, NetworkInterface, SnapshotCreate, SnapshotLoad, VmState};
+use crate::dtos::{DeleteVmRequest, DeployVmRequest, RestoreRequest, SnapshotInfo, SnapshotRequest, StopVmRequest, SystemInfo, VmIdRequest, VmStatus};
 use crate::ipam::IpAllocator;
 use anyhow::{Context, Result};
 use axum::extract::State;
@@ -8,7 +8,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use tower_http::services::ServeDir;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -19,6 +18,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tower_http::services::ServeDir;
 
 mod cgroups;
 mod client;
@@ -31,6 +31,7 @@ mod network;
 const KERNEL_PATH: &str = "/home/axel/aether-platform/resources/vmlinux.bin";
 const ROOTFS_PATH: &str = "/home/axel/aether-platform/resources/aether-base.ext4";
 const INSTANCE_DIR: &str = "/tmp/aether-instances";
+const SNAPSHOTS_DIR: &str = "/home/axel/aether-platform/resources/snapshots";
 
 struct AppState {
     vms: Mutex<HashMap<String, MicroVM>>,
@@ -449,9 +450,11 @@ async fn deploy_vm(
     }
 
     // Move the spawned process into the cgroup
-    let pid = vm.process.as_ref().and_then(|p| p.id()).ok_or_else(|| {
-        anyhow::anyhow!("Failed to get process ID")
-    });
+    let pid = vm
+        .process
+        .as_ref()
+        .and_then(|p| p.id())
+        .ok_or_else(|| anyhow::anyhow!("Failed to get process ID"));
 
     match pid {
         Ok(pid) => {
@@ -803,6 +806,696 @@ async fn system_info() -> impl IntoResponse {
     (StatusCode::OK, Json(info)).into_response()
 }
 
+async fn pause_vm(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VmIdRequest>,
+) -> impl IntoResponse {
+    let vm_id = req.vm_id;
+    println!("⏸️  Received Pause Request for: {}", vm_id);
+
+    // Get VM from HashMap
+    let vms = state.vms.lock().await;
+    let vm = match vms.get(&vm_id) {
+        Some(vm) => vm,
+        None => return (StatusCode::NOT_FOUND, "VM not found".to_string()).into_response(),
+    };
+
+    // Check if VM is in a pausable state (should be running)
+    let current_status = sqlx::query!(
+        r#"SELECT status FROM vms WHERE name = $1"#,
+        vm_id
+    )
+    .fetch_optional(&state.db)
+    .await;
+
+    match current_status {
+        Ok(Some(record)) => {
+            if record.status != "running" {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("VM must be running to pause (current status: {})", record.status),
+                )
+                    .into_response();
+            }
+        }
+        Ok(None) => return (StatusCode::NOT_FOUND, "VM not found in database".to_string()).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)).into_response(),
+    }
+
+    // Send PATCH request to pause the VM
+    let vm_state = VmState {
+        state: "Paused".to_string(),
+    };
+
+    match send_patch_request(&vm.socket_path, "/vm", &vm_state).await {
+        Ok(response) => {
+            if !response.contains("HTTP/1.1 2") {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to pause VM: {}", response.lines().next().unwrap_or("Unknown error")),
+                )
+                    .into_response();
+            }
+
+            // Update database status to 'paused'
+            if let Err(e) = sqlx::query!(
+                r#"UPDATE vms SET status = 'paused' WHERE name = $1"#,
+                vm_id
+            )
+            .execute(&state.db)
+            .await
+            {
+                eprintln!("⚠️ Warning: Failed to update DB status: {}", e);
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "paused", "id": vm_id })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to communicate with VM: {}", e),
+        )
+            .into_response(),
+    }
+}
+
+async fn resume_vm(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VmIdRequest>,
+) -> impl IntoResponse {
+    let vm_id = req.vm_id;
+    println!("▶️  Received Resume Request for: {}", vm_id);
+
+    // Get VM from HashMap
+    let vms = state.vms.lock().await;
+    let vm = match vms.get(&vm_id) {
+        Some(vm) => vm,
+        None => return (StatusCode::NOT_FOUND, "VM not found".to_string()).into_response(),
+    };
+
+    // Check if VM is paused
+    let current_status = sqlx::query!(
+        r#"SELECT status FROM vms WHERE name = $1"#,
+        vm_id
+    )
+    .fetch_optional(&state.db)
+    .await;
+
+    match current_status {
+        Ok(Some(record)) => {
+            if record.status != "paused" {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("VM must be paused to resume (current status: {})", record.status),
+                )
+                    .into_response();
+            }
+        }
+        Ok(None) => return (StatusCode::NOT_FOUND, "VM not found in database".to_string()).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)).into_response(),
+    }
+
+    // Send PATCH request to resume the VM
+    let vm_state = VmState {
+        state: "Resumed".to_string(),
+    };
+
+    match send_patch_request(&vm.socket_path, "/vm", &vm_state).await {
+        Ok(response) => {
+            if !response.contains("HTTP/1.1 2") {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to resume VM: {}", response.lines().next().unwrap_or("Unknown error")),
+                )
+                    .into_response();
+            }
+
+            // Update database status to 'running'
+            if let Err(e) = sqlx::query!(
+                r#"UPDATE vms SET status = 'running' WHERE name = $1"#,
+                vm_id
+            )
+            .execute(&state.db)
+            .await
+            {
+                eprintln!("⚠️ Warning: Failed to update DB status: {}", e);
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "running", "id": vm_id })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to communicate with VM: {}", e),
+        )
+            .into_response(),
+    }
+}
+
+async fn create_snapshot(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SnapshotRequest>,
+) -> impl IntoResponse {
+    let vm_id = req.vm_id;
+    println!("📸 Received Snapshot Request for: {}", vm_id);
+
+    // Get VM from HashMap
+    let vms = state.vms.lock().await;
+    let vm = match vms.get(&vm_id) {
+        Some(vm) => vm,
+        None => return (StatusCode::NOT_FOUND, "VM not found".to_string()).into_response(),
+    };
+
+    // Check if VM is running
+    let current_status = sqlx::query!(
+        r#"SELECT status FROM vms WHERE name = $1"#,
+        vm_id
+    )
+    .fetch_optional(&state.db)
+    .await;
+
+    let vm_status = match current_status {
+        Ok(Some(record)) => {
+            if record.status != "running" && record.status != "paused" {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("VM must be running or paused to snapshot (current status: {})", record.status),
+                )
+                    .into_response();
+            }
+            record.status
+        }
+        Ok(None) => return (StatusCode::NOT_FOUND, "VM not found in database".to_string()).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)).into_response(),
+    };
+
+    // Pause the VM if it's running
+    let was_running = vm_status == "running";
+    if was_running {
+        println!("   Pausing VM before snapshot...");
+        let vm_state = VmState {
+            state: "Paused".to_string(),
+        };
+
+        match send_patch_request(&vm.socket_path, "/vm", &vm_state).await {
+            Ok(response) => {
+                if !response.contains("HTTP/1.1 2") {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to pause VM: {}", response.lines().next().unwrap_or("Unknown error")),
+                    )
+                        .into_response();
+                }
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to pause VM: {}", e),
+                )
+                    .into_response();
+            }
+        }
+
+        // Update DB to paused
+        if let Err(e) = sqlx::query!(
+            r#"UPDATE vms SET status = 'paused' WHERE name = $1"#,
+            vm_id
+        )
+        .execute(&state.db)
+        .await
+        {
+            eprintln!("⚠️ Warning: Failed to update DB status: {}", e);
+        }
+    }
+
+    // Create snapshot directory
+    let snapshot_dir = format!("{}/{}", SNAPSHOTS_DIR, vm_id);
+    if let Err(e) = tokio::fs::create_dir_all(&snapshot_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create snapshot directory: {}", e),
+        )
+            .into_response();
+    }
+
+    // Generate unique snapshot filenames with timestamp
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let snap_path = format!("{}/snap_{}", snapshot_dir, timestamp);
+    let mem_path = format!("{}/mem_{}", snapshot_dir, timestamp);
+
+    // Send snapshot create request
+    println!("   Creating snapshot files...");
+    let snapshot_req = SnapshotCreate {
+        snapshot_type: "Full".to_string(),
+        snapshot_path: snap_path.clone(),
+        mem_file_path: mem_path.clone(),
+    };
+
+    match send_put_request(&vm.socket_path, "/snapshot/create", &snapshot_req).await {
+        Ok(response) => {
+            if !response.contains("HTTP/1.1 2") {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to create snapshot: {}", response.lines().next().unwrap_or("Unknown error")),
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create snapshot: {}", e),
+            )
+                .into_response();
+        }
+    }
+
+    // Get file sizes
+    let snap_size = match tokio::fs::metadata(&snap_path).await {
+        Ok(metadata) => metadata.len(),
+        Err(e) => {
+            eprintln!("⚠️ Warning: Failed to get snapshot file size: {}", e);
+            0
+        }
+    };
+
+    let mem_size = match tokio::fs::metadata(&mem_path).await {
+        Ok(metadata) => metadata.len(),
+        Err(e) => {
+            eprintln!("⚠️ Warning: Failed to get memory file size: {}", e);
+            0
+        }
+    };
+
+    let total_mb = ((snap_size + mem_size) / 1_048_576) as i32;
+    println!("   Snapshot size: {} MB", total_mb);
+
+    // Insert into database
+    let snapshot_result = sqlx::query!(
+        r#"
+        INSERT INTO snapshots (vm_id, snapshot_path, mem_file_path, file_size_mb, description)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, created_at
+        "#,
+        vm_id,
+        snap_path,
+        mem_path,
+        total_mb,
+        req.description
+    )
+    .fetch_one(&state.db)
+    .await;
+
+    let (snapshot_id, created_at) = match snapshot_result {
+        Ok(record) => (record.id.to_string(), record.created_at.to_rfc3339()),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save snapshot to database: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    // Resume VM if it was running before
+    if was_running {
+        println!("   Resuming VM after snapshot...");
+        let resume_state = VmState {
+            state: "Resumed".to_string(),
+        };
+
+        match send_patch_request(&vm.socket_path, "/vm", &resume_state).await {
+            Ok(response) => {
+                if !response.contains("HTTP/1.1 2") {
+                    eprintln!("⚠️ Warning: Failed to resume VM after snapshot");
+                } else {
+                    // Update DB to running
+                    if let Err(e) = sqlx::query!(
+                        r#"UPDATE vms SET status = 'running' WHERE name = $1"#,
+                        vm_id
+                    )
+                    .execute(&state.db)
+                    .await
+                    {
+                        eprintln!("⚠️ Warning: Failed to update DB status: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️ Warning: Failed to resume VM: {}", e);
+            }
+        }
+    }
+
+    println!("✅ Snapshot created successfully: {}", snapshot_id);
+
+    let snapshot_info = SnapshotInfo {
+        id: snapshot_id,
+        vm_id,
+        created_at,
+        size_mb: total_mb,
+    };
+
+    (StatusCode::OK, Json(snapshot_info)).into_response()
+}
+
+async fn restore_vm(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RestoreRequest>,
+) -> impl IntoResponse {
+    let new_vm_id = req.new_vm_id.clone();
+    println!("🔄 Received Restore Request for snapshot: {} as VM: {}", req.snapshot_id, new_vm_id);
+
+    // Validate new_vm_id
+    if new_vm_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "new_vm_id cannot be empty".to_string()).into_response();
+    }
+
+    if new_vm_id.len() > 15 {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("new_vm_id too long (max 15 chars, got {})", new_vm_id.len()),
+        )
+            .into_response();
+    }
+
+    if !new_vm_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "new_vm_id can only contain alphanumeric characters and dashes".to_string(),
+        )
+            .into_response();
+    }
+
+    // Check if VM already exists
+    if state.vms.lock().await.contains_key(&new_vm_id) {
+        return (StatusCode::CONFLICT, "VM with this ID already exists".to_string()).into_response();
+    }
+
+    // Parse snapshot UUID
+    let snapshot_uuid = match uuid::Uuid::parse_str(&req.snapshot_id) {
+        Ok(uuid) => uuid,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid snapshot ID format".to_string()).into_response(),
+    };
+
+    // Fetch snapshot metadata from database
+    let snapshot = match sqlx::query!(
+        r#"SELECT snapshot_path, mem_file_path FROM snapshots WHERE id = $1"#,
+        snapshot_uuid
+    )
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Snapshot not found".to_string()).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)).into_response(),
+    };
+
+    // Verify snapshot files exist
+    if !std::path::Path::new(&snapshot.snapshot_path).exists() {
+        return (StatusCode::NOT_FOUND, format!("Snapshot file not found: {}", snapshot.snapshot_path)).into_response();
+    }
+    if !std::path::Path::new(&snapshot.mem_file_path).exists() {
+        return (StatusCode::NOT_FOUND, format!("Memory file not found: {}", snapshot.mem_file_path)).into_response();
+    }
+
+    println!("   Snapshot files verified");
+
+    // Allocate IP
+    let octet = {
+        let mut ip_lock = state.ipam.lock().await;
+        match ip_lock.allocate() {
+            Some(i) => i,
+            None => return (StatusCode::SERVICE_UNAVAILABLE, "Subnet Full".to_string()).into_response(),
+        }
+    };
+    let guest_ip = format!("172.16.0.{}", octet);
+    let gateway_ip = "172.16.0.1";
+    let tap_name = new_vm_id.clone();
+
+    println!("   Allocated IP: {}", guest_ip);
+
+    // Setup Cgroup
+    if let Err(e) = cgroups::create_vm_cgroup(&new_vm_id) {
+        state.ipam.lock().await.free(octet);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cgroup Error: {}", e),
+        )
+            .into_response();
+    }
+
+    // Apply resource limits
+    if let Err(e) = cgroups::apply_limits(&new_vm_id, 20000, 128 * 1024 * 1024) {
+        state.ipam.lock().await.free(octet);
+        let _ = cgroups::remove_vm_cgroup(&new_vm_id);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cgroup Limits Error: {}", e),
+        )
+            .into_response();
+    }
+
+    // Create DB record
+    let vm_uuid = uuid::Uuid::parse_str(&new_vm_id).unwrap_or_else(|_| uuid::Uuid::new_v4());
+    if let Err(e) = sqlx::query!(
+        r#"
+        INSERT INTO vms (id, name, status, ip_address, tap_interface)
+        VALUES ($1, $2, 'starting', $3, $4)
+        "#,
+        vm_uuid,
+        new_vm_id,
+        guest_ip,
+        tap_name
+    )
+    .execute(&state.db)
+    .await
+    {
+        state.ipam.lock().await.free(octet);
+        let _ = cgroups::remove_vm_cgroup(&new_vm_id);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB Error: {}", e),
+        )
+            .into_response();
+    }
+
+    // Setup network
+    if let Err(e) = state.network_manager.setup_tap_bridge(&tap_name, "br0").await {
+        state.ipam.lock().await.free(octet);
+        let _ = cgroups::remove_vm_cgroup(&new_vm_id);
+        let _ = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, new_vm_id)
+            .execute(&state.db)
+            .await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Network Error: {}", e),
+        )
+            .into_response();
+    }
+
+    println!("   Network configured");
+
+    // Create VM struct
+    let mut vm = MicroVM::new(&new_vm_id, &tap_name, &guest_ip, gateway_ip, octet);
+
+    // Spawn Firecracker process
+    if let Err(e) = vm.start_process().await {
+        state.ipam.lock().await.free(octet);
+        let _ = state.network_manager.teardown_tap(&tap_name).await;
+        let _ = cgroups::remove_vm_cgroup(&new_vm_id);
+        let _ = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, new_vm_id)
+            .execute(&state.db)
+            .await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start Firecracker: {}", e)).into_response();
+    }
+
+    println!("   Firecracker process spawned");
+
+    // Move process to cgroup
+    let pid = vm.process.as_ref().and_then(|p| p.id()).ok_or_else(|| anyhow::anyhow!("Failed to get process ID"));
+    match pid {
+        Ok(pid) => {
+            if let Err(e) = cgroups::add_process(&new_vm_id, pid) {
+                state.ipam.lock().await.free(octet);
+                let _ = vm.cleanup(&state.network_manager).await;
+                let _ = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, new_vm_id)
+                    .execute(&state.db)
+                    .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Cgroup Process Jail Error: {}", e),
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            state.ipam.lock().await.free(octet);
+            let _ = vm.cleanup(&state.network_manager).await;
+            let _ = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, new_vm_id)
+                .execute(&state.db)
+                .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get process ID: {}", e),
+            )
+                .into_response();
+        }
+    }
+
+    // IMPORTANT: Do NOT configure machine-config or network-interfaces before loading a snapshot!
+    // Firecracker snapshots already contain those configurations. Configuring them again
+    // will cause: "Loading a microVM snapshot not allowed after configuring boot-specific resources."
+
+    println!("   Skipping machine/network config (snapshot contains them)");
+
+    // Firecracker snapshots contain the original drive path. We must ensure the disk
+    // exists at that EXACT path for portable snapshot restore to work.
+    let original_vm_id = match sqlx::query!(
+        r#"SELECT vm_id FROM snapshots WHERE id = $1"#,
+        snapshot_uuid
+    )
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(record) => record.vm_id,
+        Err(e) => {
+            state.ipam.lock().await.free(octet);
+            let _ = vm.cleanup(&state.network_manager).await;
+            let _ = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, new_vm_id)
+                .execute(&state.db)
+                .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get original VM ID: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    let original_disk_path = format!("{}/rootfs-{}.ext4", INSTANCE_DIR, original_vm_id);
+    println!("   Snapshot expects disk at: {}", original_disk_path);
+
+    // Ensure the disk exists at the original path (create if missing for portability)
+    if !std::path::Path::new(&original_disk_path).exists() {
+        println!("   Creating disk from base image...");
+        if let Err(e) = prepare_instance_drive(&original_vm_id).await {
+            state.ipam.lock().await.free(octet);
+            let _ = vm.cleanup(&state.network_manager).await;
+            let _ = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, new_vm_id)
+                .execute(&state.db)
+                .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to prepare disk: {}", e),
+            )
+                .into_response();
+        }
+    } else {
+        println!("   Using existing disk file");
+    }
+
+    // DO NOT attach drives manually - the snapshot already contains drive config!
+    // Firecracker will restore drives automatically during snapshot load.
+
+    // Load snapshot
+    println!("   Loading snapshot...");
+    let load_req = SnapshotLoad {
+        snapshot_path: snapshot.snapshot_path,
+        mem_file_path: snapshot.mem_file_path,
+        enable_diff_snapshots: false,
+        resume_vm: false,
+    };
+
+    match send_put_request(&vm.socket_path, "/snapshot/load", &load_req).await {
+        Ok(response) => {
+            if !response.contains("HTTP/1.1 2") {
+                state.ipam.lock().await.free(octet);
+                let _ = vm.cleanup(&state.network_manager).await;
+                let _ = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, new_vm_id)
+                    .execute(&state.db)
+                    .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to load snapshot: {}", response.lines().next().unwrap_or("Unknown error")),
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            state.ipam.lock().await.free(octet);
+            let _ = vm.cleanup(&state.network_manager).await;
+            let _ = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, new_vm_id)
+                .execute(&state.db)
+                .await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Snapshot load error: {}", e)).into_response();
+        }
+    }
+
+    // Resume the VM
+    println!("   Resuming VM...");
+    let resume_state = VmState {
+        state: "Resumed".to_string(),
+    };
+
+    match send_patch_request(&vm.socket_path, "/vm", &resume_state).await {
+        Ok(response) => {
+            if !response.contains("HTTP/1.1 2") {
+                state.ipam.lock().await.free(octet);
+                let _ = vm.cleanup(&state.network_manager).await;
+                let _ = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, new_vm_id)
+                    .execute(&state.db)
+                    .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to resume VM: {}", response.lines().next().unwrap_or("Unknown error")),
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            state.ipam.lock().await.free(octet);
+            let _ = vm.cleanup(&state.network_manager).await;
+            let _ = sqlx::query!(r#"DELETE FROM vms WHERE name = $1"#, new_vm_id)
+                .execute(&state.db)
+                .await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Resume error: {}", e)).into_response();
+        }
+    }
+
+    // Update DB status to running
+    if let Err(e) = sqlx::query!(
+        r#"UPDATE vms SET status = 'running' WHERE name = $1"#,
+        new_vm_id
+    )
+    .execute(&state.db)
+    .await
+    {
+        eprintln!("⚠️ Warning: Failed to update DB status: {}", e);
+    }
+
+    // Store in HashMap
+    state.vms.lock().await.insert(new_vm_id.clone(), vm);
+
+    println!("✅ VM restored successfully from snapshot");
+
+    let vm_status = VmStatus {
+        id: new_vm_id,
+        ip: guest_ip,
+        status: "running".to_string(),
+        tap: tap_name,
+        stats: None,
+    };
+
+    (StatusCode::OK, Json(vm_status)).into_response()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Raise capabilities once at the start for all network operations
@@ -893,6 +1586,10 @@ async fn main() -> Result<()> {
         .route("/api/vms", get(list_vms))
         .route("/api/system", get(system_info))
         .route("/api/health", get(|| async { "Aether is running" }))
+        .route("/api/vms/pause", post(pause_vm))
+        .route("/api/vms/resume", post(resume_vm))
+        .route("/api/vms/snapshot", post(create_snapshot))
+        .route("/api/vms/restore", post(restore_vm))
         .fallback_service(ServeDir::new("static"))
         .with_state(shared_state.clone());
 

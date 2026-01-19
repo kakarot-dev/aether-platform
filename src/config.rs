@@ -33,3 +33,23 @@ pub struct NetworkInterface {
     pub iface_id: String,
     pub host_dev_name: String,
 }
+
+#[derive(Serialize)]
+pub struct VmState {
+    pub state: String, // "Paused" or "Resumed"
+}
+
+#[derive(Serialize)]
+pub struct SnapshotCreate {
+    pub snapshot_type: String, // "Full"
+    pub snapshot_path: String,
+    pub mem_file_path: String,
+}
+
+#[derive(Serialize)]
+pub struct SnapshotLoad {
+    pub snapshot_path: String,
+    pub mem_file_path: String,
+    pub enable_diff_snapshots: bool,
+    pub resume_vm: bool,
+}
