@@ -24,6 +24,10 @@ pub struct VmStatus {
     pub tap: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<CgroupStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_from_snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -42,6 +46,7 @@ pub struct VmIdRequest {
 #[derive(Deserialize)]
 pub struct SnapshotRequest {
     pub vm_id: String,
+    pub name: String,
     pub description: Option<String>,
 }
 
@@ -51,10 +56,26 @@ pub struct RestoreRequest {
     pub new_vm_id: String,
 }
 
+#[derive(Deserialize)]
+pub struct DeleteSnapshotRequest {
+    pub snapshot_id: String,
+}
+
 #[derive(Serialize)]
 pub struct SnapshotInfo {
     pub id: String,
     pub vm_id: String,
     pub created_at: String,
     pub size_mb: i32,
+}
+
+#[derive(Serialize)]
+pub struct SnapshotListItem {
+    pub id: String,
+    pub vm_id: String,
+    pub name: String,
+    pub created_at: String,
+    pub size_mb: i32,
+    pub description: Option<String>,
+    pub source_vm_status: Option<String>,
 }

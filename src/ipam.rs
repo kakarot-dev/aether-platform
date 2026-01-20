@@ -27,4 +27,14 @@ impl IpAllocator {
             self.used[octet as usize] = false;
         }
     }
+
+    /// Try to allocate a specific IP octet. Returns true if successful, false if already in use.
+    pub fn try_allocate_specific(&mut self, octet: u8) -> bool {
+        if octet > 1 && octet < 255 && !self.used[octet as usize] {
+            self.used[octet as usize] = true;
+            true
+        } else {
+            false
+        }
+    }
 }
