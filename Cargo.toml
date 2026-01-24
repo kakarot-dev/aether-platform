@@ -9,7 +9,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 caps = "0.5.6"
-axum = "0.8.8"
+axum = { version = "0.8.8", features = ["ws"] }
 tower = "0.5.3"
 tower-http = { version = "0.6.8", features = ["fs"] }
 tracing = "0.1.44"
@@ -28,3 +28,6 @@ futures-util = "0.3"
 ipnetwork = "0.20"
 libc = "0.2"
 iptables = "0.6.0"
+
+# Real-time telemetry
+tokio-stream = "0.1"
